@@ -55,7 +55,14 @@ async def _run() -> int:
 
         tasks = [
             asyncio.create_task(
-                watcher_mod.run(cfg.certstream_url, state, store, webhook, stop),
+                watcher_mod.run(
+                    cfg.certstream_url,
+                    state,
+                    store,
+                    webhook,
+                    stop,
+                    suspicious_grace_s=cfg.suspicious_grace_s,
+                ),
                 name="watcher",
             ),
             asyncio.create_task(

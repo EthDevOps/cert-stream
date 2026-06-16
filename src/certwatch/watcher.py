@@ -51,11 +51,84 @@ def _build_payload(
     }
 
 
+async def _emit_alert(
+    *,
+    store: Store,
+    webhook: Webhook,
+    fp: str,
+    sans: list[str],
+    matched_entries: list[str],
+    matched_sans: list[str],
+    issuer_summary: str | None,
+    data: dict[str, Any],
+    seen_at: int,
+    severity: str,
+) -> None:
+    payload = _build_payload(data, fp, matched_entries, matched_sans, severity)
+    alert_id = await store.insert_alert(
+        fingerprint=fp,
+        sans=sans,
+        matched=sorted(matched_entries),
+        issuer=issuer_summary,
+        seen_at=seen_at,
+        severity=severity,
+    )
+    metrics.ALERTS.labels(severity=severity).inc()
+    log.info(
+        "ALERT id=%d severity=%s fp=%s matched=%s issuer=%s",
+        alert_id, severity, fp, sorted(matched_entries), issuer_summary,
+    )
+    delivered = await webhook.deliver(payload)
+    if delivered:
+        await store.mark_alert_delivered(alert_id)
+
+
+async def _classify_after_grace(
+    *,
+    state: State,
+    store: Store,
+    webhook: Webhook,
+    grace_seconds: float,
+    fp: str,
+    sans: list[str],
+    matched_entries: list[str],
+    matched_sans: list[str],
+    issuer_summary: str | None,
+    data: dict[str, Any],
+    seen_at: int,
+) -> None:
+    # Window for the LB hook to register the fp via POST /certs before we
+    # flag suspicious. If it lands during the wait, we downgrade to info.
+    try:
+        await asyncio.sleep(grace_seconds)
+    except asyncio.CancelledError:
+        return
+    if fp in state.known_fingerprints:
+        log.info("grace: fp %s registered during window, downgrading to info", fp)
+        severity = SEVERITY_INFO
+    else:
+        severity = SEVERITY_SUSPICIOUS
+    await _emit_alert(
+        store=store,
+        webhook=webhook,
+        fp=fp,
+        sans=sans,
+        matched_entries=matched_entries,
+        matched_sans=matched_sans,
+        issuer_summary=issuer_summary,
+        data=data,
+        seen_at=seen_at,
+        severity=severity,
+    )
+
+
 async def _handle_message(
     raw: str | bytes,
     state: State,
     store: Store,
     webhook: Webhook,
+    grace_seconds: float,
+    pending: set[asyncio.Task[None]],
 ) -> None:
     msg = json.loads(raw)
     mtype = msg.get("message_type") or "unknown"
@@ -98,30 +171,38 @@ async def _handle_message(
     state.record_recent(fp)
     metrics.DEDUPE_CACHE_SIZE.set(state.dedupe_size())
 
-    severity = SEVERITY_INFO if fp in state.known_fingerprints else SEVERITY_SUSPICIOUS
-
     issuer = leaf.get("issuer") or {}
     issuer_summary = issuer.get("aggregated") or issuer.get("O") or issuer.get("CN")
-    payload = _build_payload(data, fp, list(matched_entries), list(matched_sans), severity)
-
     seen_at = int(data.get("seen") or 0)
-    alert_id = await store.insert_alert(
-        fingerprint=fp,
+    alert_kwargs: dict[str, Any] = dict(
+        fp=fp,
         sans=sans,
-        matched=sorted(matched_entries),
-        issuer=issuer_summary,
+        matched_entries=list(matched_entries),
+        matched_sans=list(matched_sans),
+        issuer_summary=issuer_summary,
+        data=data,
         seen_at=seen_at,
-        severity=severity,
-    )
-    metrics.ALERTS.labels(severity=severity).inc()
-    log.info(
-        "ALERT id=%d severity=%s fp=%s matched=%s issuer=%s",
-        alert_id, severity, fp, sorted(matched_entries), issuer_summary,
     )
 
-    delivered = await webhook.deliver(payload)
-    if delivered:
-        await store.mark_alert_delivered(alert_id)
+    if fp in state.known_fingerprints:
+        await _emit_alert(
+            store=store, webhook=webhook, severity=SEVERITY_INFO, **alert_kwargs,
+        )
+        return
+
+    # Unknown fp — defer classification so the LB webhook has a chance to land.
+    task = asyncio.create_task(
+        _classify_after_grace(
+            state=state,
+            store=store,
+            webhook=webhook,
+            grace_seconds=grace_seconds,
+            **alert_kwargs,
+        ),
+        name=f"classify:{fp}",
+    )
+    pending.add(task)
+    task.add_done_callback(pending.discard)
 
 
 async def run(
@@ -130,9 +211,11 @@ async def run(
     store: Store,
     webhook: Webhook,
     stop: asyncio.Event,
+    suspicious_grace_s: float = 10.0,
 ) -> None:
     log.info("connecting to %s", url)
     metrics.WS_CONNECTED.set(0)
+    pending_alerts: set[asyncio.Task[None]] = set()
     while not stop.is_set():
         try:
             async with websockets.connect(url, max_size=None, ping_interval=20) as ws:
@@ -150,7 +233,9 @@ async def run(
                         break
                     raw = recv_task.result()
                     try:
-                        await _handle_message(raw, state, store, webhook)
+                        await _handle_message(
+                            raw, state, store, webhook, suspicious_grace_s, pending_alerts,
+                        )
                     except Exception:
                         log.exception("error handling CT message")
         except websockets.ConnectionClosed as e:
@@ -166,4 +251,15 @@ async def run(
             log.exception("watcher loop crashed, retrying in 5s")
             await asyncio.sleep(5)
     metrics.WS_CONNECTED.set(0)
+    if pending_alerts:
+        log.info("draining %d pending alert(s)", len(pending_alerts))
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*pending_alerts, return_exceptions=True),
+                timeout=suspicious_grace_s + 5,
+            )
+        except asyncio.TimeoutError:
+            log.warning("timed out draining pending alerts; cancelling stragglers")
+            for t in pending_alerts:
+                t.cancel()
     log.info("watcher stopped")

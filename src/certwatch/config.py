@@ -18,6 +18,7 @@ class Config:
     cleanup_interval_s: int
     cleanup_grace_s: int
     alert_retention_s: int
+    suspicious_grace_s: float
     log_level: str
 
 
@@ -65,5 +66,6 @@ def load() -> Config:
         cleanup_interval_s=_env_int("CLEANUP_INTERVAL_S", 3600),
         cleanup_grace_s=_env_int("CLEANUP_GRACE_S", 86400),
         alert_retention_s=_env_int("ALERT_RETENTION_S", 30 * 86400),
+        suspicious_grace_s=_env_float("SUSPICIOUS_GRACE_S", 10.0),
         log_level=_env("LOG_LEVEL", "INFO") or "INFO",
     )
