@@ -2,8 +2,8 @@ import re
 from dataclasses import dataclass
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
-from prometheus_client import make_asgi_app
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response, status
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field, field_validator
 
 from .db import Store
@@ -90,7 +90,10 @@ class Deps:
 
 def build_app(deps: Deps) -> FastAPI:
     app = FastAPI(title="certwatch", version="0.1.0")
-    app.mount("/metrics", make_asgi_app())
+
+    @app.get("/metrics", include_in_schema=False)
+    async def metrics_endpoint() -> Response:
+        return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
     async def require_token(
         authorization: Annotated[str | None, Header()] = None,

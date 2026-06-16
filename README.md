@@ -157,9 +157,19 @@ done
 
 ## Webhook payload (sent to `WEBHOOK_URL`)
 
+Every cert whose SANs match the watch list produces a webhook event, classified
+by `severity`:
+
+- `info` — fingerprint is in the LB inventory. Doubles as a heartbeat: if you
+  stop seeing these in n8n, the CT pipeline is dead or your LBs stopped
+  rotating.
+- `suspicious` — fingerprint is NOT in inventory. Treat as a potential hijack
+  until proven otherwise.
+
 ```json
 {
   "fingerprint_sha1": "9414f0d3...",
+  "severity":        "suspicious",
   "matched_entries": ["*.ethereum.org"],
   "matched_sans":    ["foo.ethereum.org"],
   "all_sans":        ["foo.ethereum.org", "bar.example.com"],
@@ -176,8 +186,38 @@ done
 }
 ```
 
+A single fingerprint is delivered at most once per process lifetime (in-memory
+LRU dedupe of the last 2048 fps), so the precert + final-cert pair that CT
+publishes for one issuance produces one webhook event, not two.
+
 Retry policy: 3 attempts with 1s/4s/16s backoff. On final failure the alert
 row is left with `delivered=0` and the error is logged.
+
+## Prometheus metrics
+
+Anonymous scrape at `GET /metrics` in the standard text-exposition format.
+
+| Metric                                       | Type      | Labels                              |
+| -------------------------------------------- | --------- | ----------------------------------- |
+| `certwatch_ct_messages_total`                | counter   | `type` (certificate_update, …)      |
+| `certwatch_alerts_total`                     | counter   | `severity` (info, suspicious)       |
+| `certwatch_webhook_total`                    | counter   | `result` (success, failure)         |
+| `certwatch_webhook_duration_seconds`         | histogram | —                                   |
+| `certwatch_known_fingerprints`               | gauge     | —                                   |
+| `certwatch_watch_entries`                    | gauge     | —                                   |
+| `certwatch_last_ct_event_timestamp_seconds`  | gauge     | —                                   |
+| `certwatch_ws_connected`                     | gauge     | — (0/1)                             |
+| `certwatch_dedupe_cache_size`                | gauge     | —                                   |
+
+Suggested alerts:
+
+- `certwatch_ws_connected == 0 for 5m` → CT feed dead
+- `time() - certwatch_last_ct_event_timestamp_seconds > 600` → CT feed dead
+  (covers the case where WS is up but log is silent)
+- `rate(certwatch_alerts_total{severity="info"}[1h]) == 0 for 24h` → no LB
+  certs flowing through CT; either nothing is renewing or detection is broken
+- `increase(certwatch_alerts_total{severity="suspicious"}[5m]) > 0` → page
+- `rate(certwatch_webhook_total{result="failure"}[5m]) > 0` → n8n down
 
 ## Docker
 
