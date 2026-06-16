@@ -68,17 +68,19 @@ All routes require `Authorization: Bearer <API_TOKEN>`.
 ### Watch domains
 
 ```bash
-# add an entry (exact FQDN or leading-wildcard)
+# add an entry — covers the apex and every subdomain (any depth)
 curl -H 'Authorization: Bearer t' -H 'Content-Type: application/json' \
-  -d '{"value":"*.ethereum.org","note":"prod"}' \
+  -d '{"value":"ethereum.org","note":"prod"}' \
   http://127.0.0.1:8765/domains
 
 curl -H 'Authorization: Bearer t' http://127.0.0.1:8765/domains
 curl -X DELETE -H 'Authorization: Bearer t' http://127.0.0.1:8765/domains/foo.example.com
 ```
 
-Match semantics: CABF wildcard rules. `*.example.org` covers any single label
-under `example.org` and nothing else — neither the apex nor deeper labels.
+Match semantics: an entry `example.org` matches `example.org` and any
+subdomain (`foo.example.org`, `a.b.example.org`, …). A leading `*.` in the
+entry is stripped on input. SANs with a leading wildcard (`*.X`) match when
+their expansions overlap an entry's subtree.
 
 ### Known-good certs (LB inventory)
 
@@ -170,7 +172,7 @@ by `severity`:
 {
   "fingerprint_sha1": "9414f0d3...",
   "severity":        "suspicious",
-  "matched_entries": ["*.ethereum.org"],
+  "matched_entries": ["ethereum.org"],
   "matched_sans":    ["foo.ethereum.org"],
   "all_sans":        ["foo.ethereum.org", "bar.example.com"],
   "issuer_o":        "Google Trust Services",
@@ -251,7 +253,7 @@ API_TOKEN=t DB_PATH=/tmp/certwatch.db \
 
 # terminal 3 — seed a watch entry
 curl -H 'Authorization: Bearer t' -H 'Content-Type: application/json' \
-  -d '{"value":"*.ethereum.org"}' http://127.0.0.1:8765/domains
+  -d '{"value":"ethereum.org"}' http://127.0.0.1:8765/domains
 ```
 
 You'll see the harness print `WEBHOOK RX:` for the unauthorized cert and
