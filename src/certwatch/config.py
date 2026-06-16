@@ -51,6 +51,9 @@ def _env_float(name: str, default: float) -> float:
 def load() -> Config:
     token = _env("API_TOKEN", required=True)
     assert token is not None
+    token = token.strip()
+    if not token:
+        raise ConfigError("API_TOKEN must not be empty")
     return Config(
         certstream_url=_env("CERTSTREAM_URL", "ws://localhost:8080/full-stream") or "",
         db_path=_env("DB_PATH", "./certwatch.db") or "./certwatch.db",

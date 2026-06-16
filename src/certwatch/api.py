@@ -1,4 +1,5 @@
 import re
+import secrets
 from dataclasses import dataclass
 from typing import Annotated
 
@@ -98,9 +99,12 @@ def build_app(deps: Deps) -> FastAPI:
     async def require_token(
         authorization: Annotated[str | None, Header()] = None,
     ) -> None:
-        if not authorization or not authorization.startswith("Bearer "):
+        if not authorization:
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing bearer token")
-        if authorization.removeprefix("Bearer ").strip() != deps.token:
+        scheme, _, presented = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not presented.strip():
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing bearer token")
+        if not secrets.compare_digest(presented.strip(), deps.token):
             raise HTTPException(status.HTTP_403_FORBIDDEN, "invalid token")
 
     AuthDep = Depends(require_token)
