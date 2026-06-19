@@ -85,7 +85,6 @@ async def _emit_alert(
 
 async def _classify_after_grace(
     *,
-    state: State,
     store: Store,
     webhook: Webhook,
     grace_seconds: float,
@@ -97,13 +96,13 @@ async def _classify_after_grace(
     data: dict[str, Any],
     seen_at: int,
 ) -> None:
-    # Window for the LB hook to register the fp via POST /certs before we
-    # flag suspicious. If it lands during the wait, we downgrade to info.
+    # Window for upstream to land the fp in public.certs before we flag
+    # suspicious. If it appears during the wait, we downgrade to info.
     try:
         await asyncio.sleep(grace_seconds)
     except asyncio.CancelledError:
         return
-    if fp in state.known_fingerprints:
+    if await store.has_cert(fp):
         log.info("grace: fp %s registered during window, downgrading to info", fp)
         severity = SEVERITY_INFO
     else:
@@ -184,16 +183,15 @@ async def _handle_message(
         seen_at=seen_at,
     )
 
-    if fp in state.known_fingerprints:
+    if await store.has_cert(fp):
         await _emit_alert(
             store=store, webhook=webhook, severity=SEVERITY_INFO, **alert_kwargs,
         )
         return
 
-    # Unknown fp — defer classification so the LB webhook has a chance to land.
+    # Unknown fp — defer classification so upstream has a chance to land the row.
     task = asyncio.create_task(
         _classify_after_grace(
-            state=state,
             store=store,
             webhook=webhook,
             grace_seconds=grace_seconds,

@@ -7,6 +7,7 @@ import uvicorn
 
 from . import api as api_mod
 from . import cleanup as cleanup_mod
+from . import watch_refresh as watch_refresh_mod
 from . import watcher as watcher_mod
 from .config import ConfigError, load
 from .db import Store
@@ -37,7 +38,7 @@ async def _run() -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
-    store = await Store.open(cfg.db_path)
+    store = await Store.open(cfg.postgres_dsn)
     state = State(store)
     await state.refresh_all()
 
@@ -50,8 +51,7 @@ async def _run() -> int:
             pass
 
     async with Webhook(cfg.webhook_url, cfg.webhook_timeout_s) as webhook:
-        deps = api_mod.Deps(store=store, state=state, token=cfg.api_token)
-        app = api_mod.build_app(deps)
+        app = api_mod.build_app(state)
 
         tasks = [
             asyncio.create_task(
@@ -72,13 +72,15 @@ async def _run() -> int:
             asyncio.create_task(
                 cleanup_mod.run(
                     store,
-                    state,
                     cfg.cleanup_interval_s,
-                    cfg.cleanup_grace_s,
                     cfg.alert_retention_s,
                     stop,
                 ),
                 name="cleanup",
+            ),
+            asyncio.create_task(
+                watch_refresh_mod.run(state, cfg.watch_refresh_interval_s, stop),
+                name="watch_refresh",
             ),
         ]
 

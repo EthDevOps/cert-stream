@@ -18,21 +18,17 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 FROM python:3.13-slim-bookworm AS runtime
 
-RUN groupadd -r app && useradd -r -g app -d /app -s /usr/sbin/nologin app \
-    && mkdir -p /data \
-    && chown app:app /data
+RUN groupadd -r app && useradd -r -g app -d /app -s /usr/sbin/nologin app
 
 WORKDIR /app
 COPY --from=builder --chown=app:app /app /app
 
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
-    DB_PATH=/data/certwatch.db \
     API_HOST=0.0.0.0 \
     API_PORT=8765
 
 USER app
-VOLUME ["/data"]
 EXPOSE 8765
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

@@ -14,148 +14,82 @@ hijack.
        │   watcher    ├─────────────────► │   webhook    ├───┘
        └──────┬───────┘  fp not in DB     └──────┬───────┘
               │ ▲                                │
-              │ │                                ▼
+              │ │ has_cert?                      ▼
               │ │                        ┌──────────────┐
-              │ └────────── SQLite ──────┤   alerts     │
+              │ └────────── Postgres ────┤   alerts     │
               ▼                          └──────────────┘
-       ┌──────────────┐
-       │  HTTP API    │ ◄── LB deploy-hook pushes (sha1, sans, validity)
-       └──────────────┘ ◄── operators add/remove watch domains
+       ┌──────────────┐                  ┌────────────────────────┐
+       │ /healthz     │                  │ public.intent_current  │
+       │ /metrics     │                  │ public.certs           │
+       └──────────────┘                  │ (both upstream-managed)│
+                                         └────────────────────────┘
 ```
 
-A single asyncio process runs three concurrent tasks:
+A single asyncio process runs four concurrent tasks:
 
-1. **watcher** — consumes a [certstream-server](https://github.com/CaliDog/certstream-server) WS feed and matches each cert's SANs against the watch list
-2. **api** — FastAPI app for LBs and operators
-3. **cleanup** — prunes expired fingerprints and old alerts
+1. **watcher** — consumes a [certstream-server](https://github.com/CaliDog/certstream-server) WS feed, matches each cert's SANs against the watch list, and on a hit checks `public.certs` to decide info-vs-suspicious
+2. **api** — FastAPI app exposing `/healthz` and `/metrics` only
+3. **cleanup** — prunes old alerts
+4. **watch refresh** — re-reads `public.intent_current` every `WATCH_REFRESH_INTERVAL_S` seconds
 
-State lives in a single SQLite file.
+State lives in Postgres. Both the watched-domains list (`public.intent_current`) and the known-cert inventory (`public.certs`) are owned by upstream systems; certwatch only reads from them. The only table certwatch writes to is `public.alerts`.
 
 ## Quick start
 
 ```bash
 uv sync --extra test
-uv run pytest                            # unit tests
-API_TOKEN=changeme uv run -m certwatch   # run it
+psql "$POSTGRES_DSN" -f schema.sql        # create certs + alerts tables
+POSTGRES_DSN=postgresql://user:pw@localhost/certwatch uv run -m certwatch
 ```
 
 The service binds `127.0.0.1:8765` by default. Health check:
 
 ```bash
-curl -H 'Authorization: Bearer changeme' http://127.0.0.1:8765/healthz
+curl http://127.0.0.1:8765/healthz
 ```
 
 ## Configuration (ENV)
 
-| Var                  | Default                              | Notes                                                       |
-| -------------------- | ------------------------------------ | ----------------------------------------------------------- |
-| `API_TOKEN`          | *(required)*                         | Static bearer token for every API route                     |
-| `CERTSTREAM_URL`     | `ws://localhost:8080/full-stream`    | Upstream certstream-server                                  |
-| `DB_PATH`            | `./certwatch.db`                     | SQLite file                                                 |
-| `API_HOST`           | `127.0.0.1`                          | Bind addr                                                   |
-| `API_PORT`           | `8765`                               | Bind port                                                   |
-| `WEBHOOK_URL`        | *(unset → observer mode, log only)*  | POST destination for alerts (your n8n endpoint)             |
-| `WEBHOOK_TIMEOUT_S`  | `10`                                 | Per-attempt timeout                                         |
-| `CLEANUP_INTERVAL_S` | `3600`                               | How often to prune                                          |
-| `CLEANUP_GRACE_S`    | `86400`                              | Keep expired certs this long past `not_after`               |
-| `ALERT_RETENTION_S`  | `2592000`                            | Keep alerts 30 days                                         |
-| `LOG_LEVEL`          | `INFO`                               | stdlib logging level                                        |
+| Var                        | Default                              | Notes                                                                |
+| -------------------------- | ------------------------------------ | -------------------------------------------------------------------- |
+| `POSTGRES_DSN`             | *(required)*                         | Postgres connection string, e.g. `postgresql://user:pw@host:5432/db` |
+| `CERTSTREAM_URL`           | `ws://localhost:8080/full-stream`    | Upstream certstream-server                                           |
+| `API_HOST`                 | `127.0.0.1`                          | Bind addr                                                            |
+| `API_PORT`                 | `8765`                               | Bind port                                                            |
+| `WEBHOOK_URL`              | *(unset → observer mode, log only)*  | POST destination for alerts (your n8n endpoint)                      |
+| `WEBHOOK_TIMEOUT_S`        | `10`                                 | Per-attempt timeout                                                  |
+| `CLEANUP_INTERVAL_S`       | `3600`                               | How often to prune                                                   |
+| `ALERT_RETENTION_S`        | `2592000`                            | Keep alerts 30 days                                                  |
+| `SUSPICIOUS_GRACE_S`       | `10`                                 | Wait this long for upstream to land an fp in `public.certs` before flagging |
+| `WATCH_REFRESH_INTERVAL_S` | `60`                                 | How often to re-read `public.intent_current`                         |
+| `LOG_LEVEL`                | `INFO`                               | stdlib logging level                                                 |
 
 ## API
 
-All routes require `Authorization: Bearer <API_TOKEN>`.
+The service exposes two anonymous endpoints:
 
-### Watch domains
+| Endpoint     | Purpose                                                                |
+| ------------ | ---------------------------------------------------------------------- |
+| `GET /healthz` | Liveness check; returns `{ok, watch_entries, last_ct_event_at}`.       |
+| `GET /metrics` | Prometheus text-exposition scrape.                                     |
 
-```bash
-# add an entry — covers the apex and every subdomain (any depth)
-curl -H 'Authorization: Bearer t' -H 'Content-Type: application/json' \
-  -d '{"value":"ethereum.org","note":"prod"}' \
-  http://127.0.0.1:8765/domains
+Inspect the data directly in Postgres:
 
-curl -H 'Authorization: Bearer t' http://127.0.0.1:8765/domains
-curl -X DELETE -H 'Authorization: Bearer t' http://127.0.0.1:8765/domains/foo.example.com
+```sql
+-- what we're currently watching
+SELECT fqdn FROM public.intent_current;
+
+-- known-good certs (upstream-managed)
+SELECT * FROM public.certs;
+
+-- recent alerts (the only table certwatch writes to)
+SELECT * FROM public.alerts ORDER BY id DESC LIMIT 50;
 ```
 
 Match semantics: an entry `example.org` matches `example.org` and any
 subdomain (`foo.example.org`, `a.b.example.org`, …). A leading `*.` in the
-entry is stripped on input. SANs with a leading wildcard (`*.X`) match when
-their expansions overlap an entry's subtree.
-
-### Known-good certs (LB inventory)
-
-```bash
-curl -H 'Authorization: Bearer t' -H 'Content-Type: application/json' \
-  -d '{
-    "fingerprint": "AA:BB:CC:...",        # any case, colons optional
-    "sans": ["foo.ethereum.org"],
-    "not_before": 1761915088,
-    "not_after":  1762519888,
-    "serial":     "B7591541...",
-    "source":     "lb:colo-lb-0"
-  }' \
-  http://127.0.0.1:8765/certs
-
-curl -H 'Authorization: Bearer t' http://127.0.0.1:8765/certs
-curl -X DELETE -H 'Authorization: Bearer t' http://127.0.0.1:8765/certs/<sha1>
-```
-
-Upserts on fingerprint (SHA-1, lowercase-hex). Idempotent — safe to re-POST.
-
-For certs your LBs don't manage (e.g. Netlify-issued for some properties),
-push them through this same endpoint with `source: "manual:netlify"` or
-similar. Anything in the table suppresses the alert.
-
-### Alerts (read-only)
-
-```bash
-curl -H 'Authorization: Bearer t' 'http://127.0.0.1:8765/alerts?since=1761900000&limit=50'
-```
-
-## LB hook (certbot)
-
-Drop this on every LB at `/etc/letsencrypt/renewal-hooks/deploy/10-certwatch.sh`,
-`chmod +x`. Certbot fires it after every successful renewal:
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-: "${CERTWATCH_URL:?must be set}"   # e.g. http://certwatch.internal:8765
-: "${CERTWATCH_TOKEN:?must be set}"
-
-CERT="$RENEWED_LINEAGE/cert.pem"
-
-FP=$(openssl x509 -in "$CERT" -noout -fingerprint -sha1 \
-     | cut -d= -f2 | tr -d ':' | tr A-F a-f)
-SERIAL=$(openssl x509 -in "$CERT" -noout -serial | cut -d= -f2 | tr A-F a-f)
-NB=$(date -u -d "$(openssl x509 -in "$CERT" -noout -startdate | cut -d= -f2)" +%s)
-NA=$(date -u -d "$(openssl x509 -in "$CERT" -noout -enddate   | cut -d= -f2)" +%s)
-SANS_JSON=$(openssl x509 -in "$CERT" -noout -ext subjectAltName \
-            | grep -oE 'DNS:[^,]+' | sed 's/DNS://g' \
-            | jq -R . | jq -s -c .)
-
-curl -fsS -X POST "$CERTWATCH_URL/certs" \
-  -H "Authorization: Bearer $CERTWATCH_TOKEN" \
-  -H 'Content-Type: application/json' \
-  -d "{
-    \"fingerprint\": \"$FP\",
-    \"serial\":      \"$SERIAL\",
-    \"sans\":        $SANS_JSON,
-    \"not_before\":  $NB,
-    \"not_after\":   $NA,
-    \"source\":      \"lb:$(hostname)\"
-  }"
-```
-
-Bulk catch-up (run once per LB to seed the inventory with currently-deployed
-certs without waiting for the next renewal cycle):
-
-```bash
-for live in /etc/letsencrypt/live/*/cert.pem; do
-  RENEWED_LINEAGE="$(dirname "$live")" /etc/letsencrypt/renewal-hooks/deploy/10-certwatch.sh
-done
-```
+`intent_current.fqdn` value is stripped on read. SANs with a leading
+wildcard (`*.X`) match when their expansions overlap an entry's subtree.
 
 ## Webhook payload (sent to `WEBHOOK_URL`)
 
@@ -197,7 +131,7 @@ row is left with `delivered=0` and the error is logged.
 
 ## Prometheus metrics
 
-Anonymous scrape at `GET /metrics` in the standard text-exposition format.
+`GET /metrics` in the standard text-exposition format.
 
 | Metric                                       | Type      | Labels                              |
 | -------------------------------------------- | --------- | ----------------------------------- |
@@ -205,7 +139,6 @@ Anonymous scrape at `GET /metrics` in the standard text-exposition format.
 | `certwatch_alerts_total`                     | counter   | `severity` (info, suspicious)       |
 | `certwatch_webhook_total`                    | counter   | `result` (success, failure)         |
 | `certwatch_webhook_duration_seconds`         | histogram | —                                   |
-| `certwatch_known_fingerprints`               | gauge     | —                                   |
 | `certwatch_watch_entries`                    | gauge     | —                                   |
 | `certwatch_last_ct_event_timestamp_seconds`  | gauge     | —                                   |
 | `certwatch_ws_connected`                     | gauge     | — (0/1)                             |
@@ -216,8 +149,8 @@ Suggested alerts:
 - `certwatch_ws_connected == 0 for 5m` → CT feed dead
 - `time() - certwatch_last_ct_event_timestamp_seconds > 600` → CT feed dead
   (covers the case where WS is up but log is silent)
-- `rate(certwatch_alerts_total{severity="info"}[1h]) == 0 for 24h` → no LB
-  certs flowing through CT; either nothing is renewing or detection is broken
+- `rate(certwatch_alerts_total{severity="info"}[1h]) == 0 for 24h` → no
+  upstream-known certs flowing through CT; either nothing is renewing or detection is broken
 - `increase(certwatch_alerts_total{severity="suspicious"}[5m]) > 0` → page
 - `rate(certwatch_webhook_total{result="failure"}[5m]) > 0` → n8n down
 
@@ -227,17 +160,16 @@ Suggested alerts:
 docker build -t certwatch .
 
 docker run -d --name certwatch \
-  -e API_TOKEN=changeme \
+  -e POSTGRES_DSN=postgresql://user:pw@db.internal:5432/certwatch \
   -e CERTSTREAM_URL=ws://certstream.internal:8080/full-stream \
   -e WEBHOOK_URL=https://n8n.internal/webhook/cert-alerts \
-  -v certwatch-data:/data \
   -p 8765:8765 \
   certwatch
 ```
 
-The container runs as a non-root user, persists state in the `/data` volume
-(`DB_PATH=/data/certwatch.db` by default), and exposes a Docker HEALTHCHECK
-against `/healthz`.
+The container runs as a non-root user. All state lives in Postgres — apply
+`schema.sql` against the target DB once before first start. The image exposes
+a Docker HEALTHCHECK against `/healthz`.
 
 ## End-to-end smoke test
 
@@ -245,15 +177,15 @@ against `/healthz`.
 # terminal 1 — fake certstream + fake webhook receiver
 uv run python tests/e2e_harness.py
 
-# terminal 2 — point certwatch at the harness
-API_TOKEN=t DB_PATH=/tmp/certwatch.db \
+# terminal 2 — seed a watch entry in Postgres
+psql "$POSTGRES_DSN" -c \
+  "INSERT INTO public.intent_current (fqdn) VALUES ('ethereum.org') ON CONFLICT DO NOTHING;"
+
+# terminal 3 — point certwatch at the harness
+POSTGRES_DSN="$POSTGRES_DSN" \
   CERTSTREAM_URL=ws://127.0.0.1:19090 \
   WEBHOOK_URL=http://127.0.0.1:19091/hook \
   uv run -m certwatch
-
-# terminal 3 — seed a watch entry
-curl -H 'Authorization: Bearer t' -H 'Content-Type: application/json' \
-  -d '{"value":"ethereum.org"}' http://127.0.0.1:8765/domains
 ```
 
 You'll see the harness print `WEBHOOK RX:` for the unauthorized cert and
@@ -261,7 +193,7 @@ nothing for the known/unwatched ones.
 
 ## Non-goals
 
-- Web dashboard. Use Grafana over the SQLite file or look at `/alerts`.
+- Web dashboard. Use Grafana over Postgres, or query the `alerts` table directly.
 - Pulling directly from CT logs ([SSLMate Cert Spotter](https://github.com/SSLMate/certspotter) does that). certstream is fine as a low-latency signal but it does drop entries occasionally.
-- Per-LB credentials. Single shared bearer is enough for an internal service.
-- Replay of failed webhook deliveries. The DB keeps `delivered=0` rows; bolt on a sweep later if needed.
+- HTTP-driven mutation. The service is a one-way pipe: read from Postgres, push to webhook. Domain and cert inventory are managed elsewhere.
+- Replay of failed webhook deliveries. The DB keeps `delivered=false` rows; bolt on a sweep later if needed.

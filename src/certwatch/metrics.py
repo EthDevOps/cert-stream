@@ -24,11 +24,6 @@ WEBHOOK_DURATION = Histogram(
     buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30),
 )
 
-KNOWN_FPS = Gauge(
-    "certwatch_known_fingerprints",
-    "Number of known-good cert fingerprints in inventory",
-)
-
 WATCH_ENTRIES = Gauge(
     "certwatch_watch_entries",
     "Number of watch-list entries",
